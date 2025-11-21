@@ -1,0 +1,5 @@
+prompt: auto
+threshold: 0.05
+detections_saved: 40
+auto_mode: True
+model_prompt: visual

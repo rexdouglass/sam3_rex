@@ -59,6 +59,8 @@ def run(
     threshold: float,
     device: str,
     max_masks: int,
+    auto_mode: bool = False,
+    auto_label: str = "auto",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     image = Image.open(image_path).convert("RGB")
@@ -67,15 +69,22 @@ def run(
     processor = Sam3Processor(model, device=device, confidence_threshold=threshold)
 
     state = processor.set_image(image.copy())
-    for prompt in prompts:
-        results_dir = output_dir / "results" / prompt.replace(" ", "_")
+    prompt_pairs: List[Tuple[str, str]] = []
+    if auto_mode:
+        # Use "visual" to drive the model without a specific textual target
+        prompt_pairs.append((auto_label, "visual"))
+    else:
+        prompt_pairs.extend((p, p) for p in prompts)
+
+    for display_prompt, model_prompt in prompt_pairs:
+        results_dir = output_dir / "results" / display_prompt.replace(" ", "_")
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        out = processor.set_text_prompt(prompt, state)
+        out = processor.set_text_prompt(model_prompt, state)
         scores = out["scores"].flatten()
         if scores.numel() == 0:
             (results_dir / "README.txt").write_text(
-                f"Prompt '{prompt}' returned no detections at threshold {threshold}.\n",
+                f"Prompt '{display_prompt}' returned no detections at threshold {threshold}.\n",
                 encoding="utf-8",
             )
             processor.reset_all_prompts(state)
@@ -92,10 +101,12 @@ def run(
         _save_masks(sel_masks, results_dir / "masks", sel_scores)
 
         annotated = image.copy()
-        _annotate_image(annotated, sel_boxes, sel_scores, prompt, results_dir / "annotated.png")
+        _annotate_image(
+            annotated, sel_boxes, sel_scores, display_prompt, results_dir / "annotated.png"
+        )
 
         (results_dir / "meta.txt").write_text(
-            f"prompt: {prompt}\nthreshold: {threshold}\ndetections_saved: {sel_scores.numel()}\n",
+            f"prompt: {display_prompt}\nthreshold: {threshold}\ndetections_saved: {sel_scores.numel()}\nauto_mode: {auto_mode}\nmodel_prompt: {model_prompt}\n",
             encoding="utf-8",
         )
         processor.reset_all_prompts(state)
@@ -107,8 +118,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompts",
         type=str,
-        required=True,
+        default=None,
         help="Comma-separated prompts (e.g., 'hand,metal housing,rotor').",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Enable auto-segment mode (no labels, uses a generic visual query).",
+    )
+    parser.add_argument(
+        "--auto-label",
+        type=str,
+        default="auto",
+        help="Label to use for auto-segment outputs.",
     )
     parser.add_argument(
         "--out",
@@ -139,5 +161,19 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    prompts = [p.strip() for p in args.prompts.split(",") if p.strip()]
-    run(args.image, prompts, args.out, args.threshold, args.device, args.max_masks)
+    prompts = []
+    if args.prompts:
+        prompts = [p.strip() for p in args.prompts.split(",") if p.strip()]
+    if not prompts and not args.auto:
+        raise SystemExit("Provide --prompts or enable --auto.")
+
+    run(
+        args.image,
+        prompts,
+        args.out,
+        args.threshold,
+        args.device,
+        args.max_masks,
+        auto_mode=args.auto,
+        auto_label=args.auto_label,
+    )
