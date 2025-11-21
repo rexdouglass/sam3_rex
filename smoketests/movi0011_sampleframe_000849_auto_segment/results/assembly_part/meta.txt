@@ -1,0 +1,3 @@
+prompt: assembly part
+threshold: 0.05
+detections_saved: 30
