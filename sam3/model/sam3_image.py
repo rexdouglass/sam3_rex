@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from sam3.model.concept_prompt import ConceptPrompt
 from sam3.model.model_misc import SAM3Output
 
 from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor
@@ -114,6 +115,96 @@ class Sam3Image(torch.nn.Module):
         self._device = None
         return super().to(*args, **kwargs)
 
+    def _encode_text_only(self, backbone_out, find_input):
+        """
+        Helper to slice text features/masks for a given FindStage.
+        Returns (txt_feats, txt_masks) with shapes [L_text, B, C] and [B, L_text].
+        """
+        txt_ids = find_input.text_ids
+        txt_feats = backbone_out["language_features"][:, txt_ids]
+        txt_masks = backbone_out["language_mask"][txt_ids]
+        return txt_feats, txt_masks
+
+    def _encode_geometry_only(
+        self,
+        backbone_out,
+        find_input,
+        geometric_prompt: Prompt,
+        prev_mask_pred=None,
+    ):
+        """
+        Compute geometry-only prompt tokens for a given image and Prompt.
+
+        Returns:
+          geo_feats: [L_geo, B, C]
+          geo_masks: [B, L_geo]
+          backbone_out: possibly updated with computed image features
+        """
+        feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
+        backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
+
+        if prev_mask_pred is not None:
+            img_feats = [img_feats[-1] + prev_mask_pred]
+
+        geo_feats, geo_masks = self.geometry_encoder(
+            geo_prompt=geometric_prompt,
+            img_feats=img_feats,
+            img_sizes=vis_feat_sizes,
+            img_pos_embeds=img_pos_embeds,
+        )
+        return geo_feats, geo_masks, backbone_out
+
+    @torch.inference_mode()
+    def encode_prompt_tokens(
+        self,
+        backbone_out,
+        find_input,
+        geometric_prompt: Prompt,
+        encode_text: bool = True,
+        prev_mask_pred=None,
+    ):
+        """
+        Compute the prompt tokens and mask from text + geometry for a single PCS stage.
+
+        Returns:
+            prompt: [L_prompt, B, C]
+            prompt_mask: [B, L_prompt]
+            num_text_tokens: int (0 if encode_text is False)
+            updated_backbone_out: possibly updated dict with image feats
+        """
+        if encode_text:
+            txt_feats, txt_masks = self._encode_text_only(backbone_out, find_input)
+            num_text_tokens = txt_feats.shape[0]
+        else:
+            txt_feats = None
+            txt_masks = None
+            num_text_tokens = 0
+
+        geo_feats, geo_masks, backbone_out = self._encode_geometry_only(
+            backbone_out=backbone_out,
+            find_input=find_input,
+            geometric_prompt=geometric_prompt,
+            prev_mask_pred=prev_mask_pred,
+        )
+
+        visual_prompt_embed = torch.zeros(
+            (0, *geo_feats.shape[1:]), device=geo_feats.device
+        )
+        visual_prompt_mask = torch.zeros(
+            (*geo_masks.shape[:-1], 0),
+            device=geo_masks.device,
+            dtype=geo_masks.dtype,
+        )
+
+        if encode_text:
+            prompt = torch.cat([txt_feats, geo_feats, visual_prompt_embed], dim=0)
+            prompt_mask = torch.cat([txt_masks, geo_masks, visual_prompt_mask], dim=1)
+        else:
+            prompt = torch.cat([geo_feats, visual_prompt_embed], dim=0)
+            prompt_mask = torch.cat([geo_masks, visual_prompt_mask], dim=1)
+
+        return prompt, prompt_mask, num_text_tokens, backbone_out
+
     def _get_img_feats(self, backbone_out, img_ids):
         """Retrieve correct image features from backbone output."""
         if "backbone_fpn" in backbone_out:
@@ -178,22 +269,15 @@ class Sam3Image(torch.nn.Module):
     ):
         # index text features (note that regardless of early or late fusion, the batch size of
         # `txt_feats` is always the number of *prompts* in the encoder)
-        txt_ids = find_input.text_ids
-        txt_feats = backbone_out["language_features"][:, txt_ids]
-        txt_masks = backbone_out["language_mask"][txt_ids]
+        txt_feats, txt_masks = self._encode_text_only(backbone_out, find_input)
 
-        feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
-        backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
-
-        if prev_mask_pred is not None:
-            img_feats = [img_feats[-1] + prev_mask_pred]
-        # Encode geometry
-        geo_feats, geo_masks = self.geometry_encoder(
-            geo_prompt=geometric_prompt,
-            img_feats=img_feats,
-            img_sizes=vis_feat_sizes,
-            img_pos_embeds=img_pos_embeds,
+        geo_feats, geo_masks, backbone_out = self._encode_geometry_only(
+            backbone_out=backbone_out,
+            find_input=find_input,
+            geometric_prompt=geometric_prompt,
+            prev_mask_pred=prev_mask_pred,
         )
+
         if visual_prompt_embed is None:
             visual_prompt_embed = torch.zeros(
                 (0, *geo_feats.shape[1:]), device=geo_feats.device
@@ -490,6 +574,60 @@ class Sam3Image(torch.nn.Module):
 
         if self.training or self.num_interactive_steps_val > 0:
             self._compute_matching(out, self.back_convert(find_target))
+        return out
+
+    def forward_with_concept_prompt(
+        self,
+        backbone_out,
+        find_input,
+        concept_prompt: ConceptPrompt,
+        find_target=None,
+    ):
+        """
+        Run PCS using a precomputed ConceptPrompt (prompt tokens + masks).
+        """
+        prompt = concept_prompt.prompt
+        prompt_mask = concept_prompt.prompt_mask
+
+        with torch.profiler.record_function("SAM3Image._run_encoder"):
+            backbone_out, encoder_out, _ = self._run_encoder(
+                backbone_out, find_input, prompt, prompt_mask
+            )
+
+        out = {
+            "encoder_hidden_states": encoder_out["encoder_hidden_states"],
+            "prev_encoder_out": {
+                "encoder_out": encoder_out,
+                "backbone_out": backbone_out,
+            },
+        }
+
+        with torch.profiler.record_function("SAM3Image._run_decoder"):
+            out, hs = self._run_decoder(
+                memory=out["encoder_hidden_states"],
+                pos_embed=encoder_out["pos_embed"],
+                src_mask=encoder_out["padding_mask"],
+                out=out,
+                prompt=prompt,
+                prompt_mask=prompt_mask,
+                encoder_out=encoder_out,
+            )
+
+        with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
+            self._run_segmentation_heads(
+                out=out,
+                backbone_out=backbone_out,
+                img_ids=find_input.img_ids,
+                vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                encoder_hidden_states=out["encoder_hidden_states"],
+                prompt=prompt,
+                prompt_mask=prompt_mask,
+                hs=hs,
+            )
+
+        if self.training or self.num_interactive_steps_val > 0:
+            if find_target is not None:
+                self._compute_matching(out, self.back_convert(find_target))
         return out
 
     def _postprocess_out(self, out: Dict, multimask_output: bool = False):

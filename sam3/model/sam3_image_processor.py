@@ -1,12 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import PIL
 import torch
 
 from sam3.model import box_ops
-
+from sam3.model.concept_prompt import ConceptPrompt
 from sam3.model.data_misc import FindStage, interpolate
 from torchvision.transforms import v2
 
@@ -179,6 +179,34 @@ class Sam3Processor:
             return self._forward_grounding(state)
         return state
 
+    def _build_geometric_prompt_from_boxes(
+        self,
+        boxes_xyxy: torch.Tensor,
+        labels: torch.Tensor,
+        state: Dict,
+    ):
+        """
+        Build a Prompt object from per-image boxes (in xyxy pixel coordinates)
+        and binary labels.
+        """
+        if "geometric_prompt" not in state:
+            geometric_prompt = self.model._get_dummy_prompt()
+        else:
+            geometric_prompt = state["geometric_prompt"]
+
+        h = state["original_height"]
+        w = state["original_width"]
+        boxes_xyxy = boxes_xyxy.to(self.device, dtype=torch.float32)
+        boxes_cxcywh = box_ops.box_xyxy_to_cxcywh(boxes_xyxy)
+        scale = torch.tensor([w, h, w, h], device=self.device, dtype=torch.float32)
+        boxes_cxcywh = boxes_cxcywh / scale
+
+        boxes = boxes_cxcywh.view(-1, 1, 4)
+        labels = labels.to(self.device).view(-1, 1).to(torch.bool)
+
+        geometric_prompt.append_boxes(boxes, labels)
+        return geometric_prompt
+
     @torch.inference_mode()
     def _forward_grounding(self, state: Dict):
         outputs = self.model.forward_grounding(
@@ -220,3 +248,241 @@ class Sam3Processor:
         state["boxes"] = boxes
         state["scores"] = out_probs
         return state
+
+    @torch.inference_mode()
+    def build_concept_prompt_from_state(
+        self,
+        state: Dict,
+        text_prompt: Optional[str] = None,
+    ) -> ConceptPrompt:
+        """
+        Build a ConceptPrompt from the current PCS state for a single image.
+        """
+        if "backbone_out" not in state:
+            raise ValueError(
+                "set_image must be called before build_concept_prompt_from_state"
+            )
+
+        geometric_prompt = state.get("geometric_prompt", self.model._get_dummy_prompt())
+
+        if "language_features" not in state["backbone_out"]:
+            text_str = text_prompt if text_prompt is not None else "visual"
+            text_outputs = self.model.backbone.forward_text(
+                [text_str], device=self.device
+            )
+            state["backbone_out"].update(text_outputs)
+
+        prompt, prompt_mask, num_text_tokens, backbone_out = self.model.encode_prompt_tokens(
+            backbone_out=state["backbone_out"],
+            find_input=self.find_stage,
+            geometric_prompt=geometric_prompt,
+            encode_text=True,
+        )
+        state["backbone_out"] = backbone_out
+
+        return ConceptPrompt(
+            prompt=prompt.detach().clone(),
+            prompt_mask=prompt_mask.detach().clone(),
+            num_text_tokens=num_text_tokens,
+            text=text_prompt,
+            meta={
+                "resolution": self.resolution,
+                "num_support_images": 1,
+                "num_support_boxes": int(geometric_prompt.box_embeddings.shape[0]),
+            },
+        )
+
+    @torch.inference_mode()
+    def build_concept_prompt(
+        self,
+        support_images: List[np.ndarray],
+        support_boxes: List[Sequence[Sequence[float]]],
+        support_labels: List[Sequence[int]],
+        text_prompt: Optional[str] = None,
+    ) -> ConceptPrompt:
+        """
+        Build a ConceptPrompt from multiple support images and exemplar boxes.
+        """
+        if not (
+            len(support_images)
+            == len(support_boxes)
+            == len(support_labels)
+        ):
+            raise ValueError(
+                "support_images, support_boxes, support_labels must have same length"
+            )
+
+        prompts = []
+        masks = []
+        num_text_tokens_list: List[int] = []
+        total_boxes = 0
+
+        for img, boxes_i, labels_i in zip(
+            support_images, support_boxes, support_labels
+        ):
+            support_state: Dict[str, Any] = {}
+            support_state = self.set_image(img, state=support_state)
+
+            if text_prompt is not None:
+                text_outputs = self.model.backbone.forward_text(
+                    [text_prompt], device=self.device
+                )
+            else:
+                text_outputs = self.model.backbone.forward_text(
+                    ["visual"], device=self.device
+                )
+            support_state["backbone_out"].update(text_outputs)
+
+            boxes_i_arr = torch.as_tensor(boxes_i, dtype=torch.float32)
+            if boxes_i_arr.numel() == 0:
+                geometric_prompt = self.model._get_dummy_prompt()
+            else:
+                labels_i_arr = torch.as_tensor(labels_i, dtype=torch.long)
+                if boxes_i_arr.ndim != 2 or boxes_i_arr.shape[1] != 4:
+                    raise ValueError("Each entry in support_boxes must be [N_i, 4]")
+                if labels_i_arr.ndim != 1 or labels_i_arr.shape[0] != boxes_i_arr.shape[0]:
+                    raise ValueError("support_labels must match support_boxes per image")
+
+                geometric_prompt = self._build_geometric_prompt_from_boxes(
+                    boxes_xyxy=boxes_i_arr,
+                    labels=labels_i_arr,
+                    state=support_state,
+                )
+                total_boxes += boxes_i_arr.shape[0]
+
+            prompt_i, prompt_mask_i, num_txt_i, backbone_out_i = (
+                self.model.encode_prompt_tokens(
+                    backbone_out=support_state["backbone_out"],
+                    find_input=self.find_stage,
+                    geometric_prompt=geometric_prompt,
+                    encode_text=True,
+                )
+            )
+            support_state["backbone_out"] = backbone_out_i
+
+            prompts.append(prompt_i)
+            masks.append(prompt_mask_i)
+            num_text_tokens_list.append(num_txt_i)
+
+        if len(prompts) == 0:
+            raise ValueError("No support examples provided")
+
+        base_num_text = num_text_tokens_list[0]
+        if any(n != base_num_text for n in num_text_tokens_list):
+            raise RuntimeError("Inconsistent num_text_tokens across supports")
+
+        base_prompt = prompts[0]
+        base_mask = masks[0]
+        txt_tokens = base_prompt[:base_num_text]
+        txt_mask = base_mask[:, :base_num_text]
+
+        geo_tokens_list = []
+        geo_masks_list = []
+        for p_i, m_i in zip(prompts, masks):
+            geo_tokens_list.append(p_i[base_num_text:])
+            geo_masks_list.append(m_i[:, base_num_text:])
+
+        if len(geo_tokens_list) > 0:
+            geo_tokens = torch.cat(geo_tokens_list, dim=0)
+            geo_mask = torch.cat(geo_masks_list, dim=1)
+        else:
+            geo_tokens = base_prompt.new_zeros((0,) + base_prompt.shape[1:])
+            geo_mask = base_mask.new_zeros((base_mask.shape[0], 0), dtype=base_mask.dtype)
+
+        prompt_all = torch.cat([txt_tokens, geo_tokens], dim=0)
+        prompt_mask_all = torch.cat([txt_mask, geo_mask], dim=1)
+
+        return ConceptPrompt(
+            prompt=prompt_all.detach().clone(),
+            prompt_mask=prompt_mask_all.detach().clone(),
+            num_text_tokens=base_num_text,
+            text=text_prompt,
+            meta={
+                "resolution": self.resolution,
+                "num_support_images": len(support_images),
+                "num_support_boxes": int(total_boxes),
+            },
+        )
+
+    @torch.inference_mode()
+    def segment_with_concept_prompt(
+        self,
+        state: Dict,
+        concept_prompt: ConceptPrompt,
+    ) -> Dict:
+        """
+        Run PCS on the image in `state` using a precomputed ConceptPrompt object.
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before segment_with_concept_prompt")
+
+        cp = concept_prompt.to(self.device)
+
+        outputs = self.model.forward_with_concept_prompt(
+            backbone_out=state["backbone_out"],
+            find_input=self.find_stage,
+            concept_prompt=cp,
+            find_target=None,
+        )
+
+        out_bbox = outputs["pred_boxes"]
+        out_logits = outputs["pred_logits"]
+        out_masks = outputs["pred_masks"]
+        out_probs = out_logits.sigmoid()
+        presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(1)
+        out_probs = (out_probs * presence_score).squeeze(-1)
+
+        keep = out_probs > self.confidence_threshold
+        out_probs = out_probs[keep]
+        out_masks = out_masks[keep]
+        out_bbox = out_bbox[keep]
+
+        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        img_h = state["original_height"]
+        img_w = state["original_width"]
+        scale_fct = torch.tensor([img_w, img_h, img_w, img_h], device=self.device)
+        boxes = boxes * scale_fct[None, :]
+
+        out_masks = interpolate(
+            out_masks.unsqueeze(1),
+            (img_h, img_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        state["scores"] = out_probs
+        state["boxes"] = boxes
+        state["masks_logits"] = out_masks
+        state["masks"] = out_masks > 0.5
+        return state
+
+    @torch.inference_mode()
+    def segment_image_with_concept_prompt(
+        self,
+        image,
+        concept_prompt: ConceptPrompt,
+    ) -> Dict:
+        """
+        Convenience wrapper to set image then segment with concept prompt.
+        """
+        state: Dict[str, Any] = {}
+        state = self.set_image(image, state=state)
+        state = self.segment_with_concept_prompt(state, concept_prompt)
+        return state
+
+    @torch.inference_mode()
+    def segment_image_batch_with_concept_prompt(
+        self,
+        images: List[np.ndarray],
+        concept_prompt: ConceptPrompt,
+    ) -> List[Dict]:
+        """
+        Batched wrapper for multiple images using the same ConceptPrompt.
+        """
+        results: List[Dict] = []
+        for img in images:
+            state: Dict[str, Any] = {}
+            state = self.set_image(img, state=state)
+            state = self.segment_with_concept_prompt(state, concept_prompt)
+            results.append(state)
+        return results

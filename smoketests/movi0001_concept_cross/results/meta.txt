@@ -1,0 +1,4 @@
+support_bbox_xyxy: (666, 337, 904, 613)
+template_match_score: 0.999369740486145
+detections_saved: 20
+threshold: 0.05
