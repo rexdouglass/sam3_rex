@@ -103,6 +103,47 @@ need to be authenticated to download the checkpoints. You can do this by running
 the following [steps](https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication)
 (e.g. `hf auth login` after generating an access token.)
 
+## Rex's SAM3 fork: reusable concept prompts
+
+This fork adds a reusable **concept prompt API** to the image model. You can encode a concept from support images (with positive/negative exemplar boxes and optional text), serialize it, and reapply it to arbitrary query images—no recomputation of box features on the query side.
+
+### Core classes
+- `ConceptPrompt` (`sam3/model/concept_prompt.py`): stores prompt tokens/masks and metadata; supports `.to(device)`, `.cpu()`, `.state_dict()`, `.from_state_dict(...)`.
+- `Sam3Processor` additions:
+  - Support pass: `build_concept_prompt_from_state(...)` (after `set_image` + prompts) or `build_concept_prompt(support_images, support_boxes, support_labels, text_prompt)`.
+  - Query pass: `segment_with_concept_prompt(state, concept_prompt)`, `segment_image_with_concept_prompt(image, concept_prompt)`, `segment_image_batch_with_concept_prompt(...)`.
+
+### Minimal usage (cross-image exemplar search)
+```python
+from PIL import Image
+import torch
+from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+model = build_sam3_image_model(load_from_HF=True, eval_mode=True, device="cuda")
+proc = Sam3Processor(model, device="cuda", confidence_threshold=0.05)
+
+# 1) Support image + exemplar box (xyxy in pixels)
+support = Image.open("support.jpg")
+ex_box = torch.tensor([[x0, y0, x1, y1]])  # shape [N,4], positives=1, negatives=0
+labels = torch.tensor([1])
+state = proc.set_image(support)
+geom = proc._build_geometric_prompt_from_boxes(ex_box, labels, state)  # internal helper
+state["geometric_prompt"] = geom
+concept = proc.build_concept_prompt_from_state(state, text_prompt="component")
+# Optional: torch.save(concept.state_dict(), "concept.pt")
+
+# 2) Query image using the saved concept prompt
+query = Image.open("query.jpg")
+res = proc.segment_image_with_concept_prompt(query, concept)
+print(res["boxes"].shape, res["scores"][:5])
+```
+
+Notes:
+- Positive/negative exemplars are baked into the prompt tokens; no labels are needed at query time.
+- You can aggregate multiple support images/boxes via `build_concept_prompt(...)`.
+- Same-image equivalence: applying a concept prompt back to its support image matches the standard text+box PCS path.
+
 ### Basic Usage
 
 ```python
